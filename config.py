@@ -12,14 +12,14 @@ class Config:
     # ============ 任务类型开关 (新增) ============
     # True: 三分类 (负面/中性/正面) -> 保留3星数据
     # False: 二分类 (负面/正面) -> 丢弃3星数据
-    USE_THREE_CLASSES = False
+    USE_THREE_CLASSES = True
 
     # ============ 语言配置 (新增) ============
     # 在这里指定每个数据集使用的语言代码
     # 可选值取决于你的CSV文件 'language' 列包含哪些语言 (例如: 'en', 'ja', 'zh', 'es', 'de', 'fr')
     TRAIN_LANG = 'en'  # 训练集语言
-    VALID_LANG = 'ja'  # 验证集语言
-    TEST_LANG = 'ja'  # 测试集语言
+    VALID_LANG = 'de'  # 验证集语言
+    TEST_LANG = 'de'  # 测试集语言
 
     # 语言代码到显示名称的映射
     LANG_MAP = {
@@ -74,13 +74,18 @@ class Config:
     NUM_CLASSES = 3  if USE_THREE_CLASSES else 2
     PROJECTION_DIM = 128  # 对比学习投影维度
 
+    # ============ 损失函数开关 (新增) ============
+    # True: 使用带有防 NaN 机制和 TNCSE 张量范数约束的新版损失函数
+    # False: 退回最原始的、标准的 SimCSE (InfoNCE) 损失函数
+    USE_NEW_LOSS = False
+
     # ============ SimCSE 关键配置 ============
     # Dropout 是 SimCSE 的核心！利用 Dropout 生成正样本对
     DROPOUT_RATE = 0.1
     # XLM-RoBERTa 默认 dropout，SimCSE 依赖此设置
     BATCH_SIZE = 32
     NUM_EPOCHS = 5  # SimCSE 通常收敛较快
-    LEARNING_RATE = 2e-5
+    LEARNING_RATE = 2e-5    #原设2e-5
     ALPHA = 0.05            #对比学习loss的比重
     TEMPERATURE = 0.05
 

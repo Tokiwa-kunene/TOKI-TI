@@ -155,6 +155,29 @@ class DataPreprocessor:
         test_df = test_df[test_df['label'] != -1].reset_index(drop=True)
         print(f"  筛选{test_lang_name}并转换标签后: {len(test_df)} 条")
 
+        # 在 test_df 语言筛选完成后、USE_SMALL_DATASET 判断之前，加入：
+
+        # ============ 新增：按"列1"文本长度过滤 ============
+        if hasattr(self.config, 'MAX_TEXT_LENGTH') and self.config.MAX_TEXT_LENGTH is not None:
+            col = '列1'
+            print("\n" + "=" * 50)
+            print(f"步骤1.4: 按'{col}'过滤 (保留 <= {self.config.MAX_TEXT_LENGTH} 的行)")
+            print("=" * 50)
+            before = (len(train_df), len(valid_df), len(test_df))
+            train_df = train_df[
+                pd.to_numeric(train_df[col], errors='coerce').fillna(999) <= self.config.MAX_TEXT_LENGTH].reset_index(
+                drop=True)
+            valid_df = valid_df[
+                pd.to_numeric(valid_df[col], errors='coerce').fillna(999) <= self.config.MAX_TEXT_LENGTH].reset_index(
+                drop=True)
+            test_df = test_df[
+                pd.to_numeric(test_df[col], errors='coerce').fillna(999) <= self.config.MAX_TEXT_LENGTH].reset_index(
+                drop=True)
+            print(f"  训练集: {before[0]} -> {len(train_df)} 条")
+            print(f"  验证集: {before[1]} -> {len(valid_df)} 条")
+            print(f"  测试集: {before[2]} -> {len(test_df)} 条")
+        # ===================================================
+
         # 如果使用小规模数据集，进行采样
         if self.config.USE_SMALL_DATASET:
             print("\n" + "=" * 50)

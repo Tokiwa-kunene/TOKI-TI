@@ -113,32 +113,54 @@ class Trainer:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _compute_neighxlm_tncse_loss(self, anchor_features, neighbor_features, raw_anchor, raw_neighbor,
-                                     neighbor_weights):
+                                     neighbor_weights, labels): # 注意这里新增了 labels 参数
         device = anchor_features.device
         batch_size = anchor_features.size(0)
 
         # =====================================================================
-        # 1. 计算 InfoNCE (双向对称对比损失) - 恢复语义对齐本质
+        # 1. 计算有监督 InfoNCE (Supervised InfoNCE) - 解决 False Negative 灾难
         # =====================================================================
-        labels = torch.arange(batch_size, device=device)
-
+        # 计算相似度矩阵: [batch_size, batch_size]
         sim_matrix_a2n = torch.matmul(anchor_features, neighbor_features.T) / self.temperature
         sim_matrix_n2a = sim_matrix_a2n.T  # 矩阵转置，计算反向相似度
 
-        # 英语找日语 (A -> N)
-        loss_a2n = F.cross_entropy(sim_matrix_a2n, labels, reduction='none')
-        # 日语找英语 (N -> A)
-        loss_n2a = F.cross_entropy(sim_matrix_n2a, labels, reduction='none')
+        # 构建标签掩码：查找 Batch 内情感标签相同的样本对
+        # label_mask[i, j] = True 表示样本 i 和 j 属于同一类 (比如都是正面情感)
+        label_mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0))
 
-        # 双向平均（比你原来的单向计算梯度更完整）
+        # 对角线是绝对正样本 (Anchor <-> 对应的 Neighbor)，必须保留
+        eye = torch.eye(batch_size, dtype=torch.bool, device=device)
+
+        # 找到“假阴性”样本：标签相同，但不是自己对应的 Neighbor
+        mask_false_negatives = label_mask & (~eye)
+
+        # 将这些同类样本在相似度矩阵中的得分设为极小值 (-1e9)
+        # 这样在后续 logsumexp 计算分母时，它们的 e^(-1e9) 会趋近于 0，不再作为负样本推开
+        sim_matrix_a2n.masked_fill_(mask_false_negatives, -1e9)
+        sim_matrix_n2a.masked_fill_(mask_false_negatives, -1e9)
+
+        # 手动计算 InfoNCE 损失
+        pos_sim_a2n = torch.diag(sim_matrix_a2n) # 提取对角线正样本得分
+        pos_sim_n2a = torch.diag(sim_matrix_n2a)
+
+        log_denominator_a2n = torch.logsumexp(sim_matrix_a2n, dim=1)
+        log_denominator_n2a = torch.logsumexp(sim_matrix_n2a, dim=1)
+
+        loss_a2n = - (pos_sim_a2n - log_denominator_a2n)
+        loss_n2a = - (pos_sim_n2a - log_denominator_n2a)
+
+        # 双向平均
         per_sample_infonce = (loss_a2n + loss_n2a) / 2.0
 
         # =====================================================================
-        # 2. 计算 TNCSE (张量范数约束) - 必须使用 raw_features 避免归一化失效
+        # 2. 计算 TNCSE (张量范数约束) - 解决原生 norm 带来的 NaN 梯度爆炸
         # =====================================================================
-        diff_norm = torch.norm(raw_anchor - raw_neighbor, p=2, dim=1)
-        anchor_norm = torch.norm(raw_anchor, p=2, dim=1)
-        neighbor_norm = torch.norm(raw_neighbor, p=2, dim=1)
+        # 加入 1e-8 防止距离极小时 torch.norm 求导产生 1/0 的无穷大梯度
+        diff_sq = torch.sum((raw_anchor - raw_neighbor) ** 2, dim=1)
+        diff_norm = torch.sqrt(diff_sq + 1e-8)
+
+        anchor_norm = torch.sqrt(torch.sum(raw_anchor ** 2, dim=1) + 1e-8)
+        neighbor_norm = torch.sqrt(torch.sum(raw_neighbor ** 2, dim=1) + 1e-8)
 
         per_sample_tn = diff_norm / (anchor_norm + neighbor_norm + 1e-8)
 
@@ -151,6 +173,32 @@ class Trainer:
         total_cl_loss = loss_infonce_weighted + self.config.BETA_TN * loss_tn_weighted
 
         return total_cl_loss, loss_infonce_weighted, loss_tn_weighted
+
+    def _compute_original_infonce_loss(self, anchor_features, neighbor_features):
+        """
+        最原始的、标准的 SimCSE (InfoNCE) 损失函数
+        (作为 Baseline 供消融实验对比使用)
+        """
+        device = anchor_features.device
+        batch_size = anchor_features.size(0)
+
+        # 生成对角线标签 [0, 1, 2, ..., batch_size-1]
+        labels_cl = torch.arange(batch_size, device=device)
+
+        # 计算余弦相似度矩阵
+        sim_matrix_a2n = torch.matmul(anchor_features, neighbor_features.T) / self.temperature
+        sim_matrix_n2a = sim_matrix_a2n.T
+
+        # 原始的 InfoNCE 就是直接算交叉熵
+        loss_a2n = F.cross_entropy(sim_matrix_a2n, labels_cl)
+        loss_n2a = F.cross_entropy(sim_matrix_n2a, labels_cl)
+
+        loss_infonce = (loss_a2n + loss_n2a) / 2.0
+
+        # 原始模式下没有 TNCSE 惩罚，因此用 0 占位，保证返回格式统一
+        loss_tn = torch.tensor(0.0, device=device)
+
+        return loss_infonce, loss_infonce, loss_tn
 
     def _compute_i2oa_loss(self, classifier_weight):
         """
@@ -293,14 +341,20 @@ class Trainer:
             loss_cls = loss_ce + self.lambda_i2oa * loss_i2oa
 
             # ── (5) 对比损失 = 双向 InfoNCE + β_tn * 加权 L_TN ──────────────
-            loss_cl, loss_infonce, loss_tn = self._compute_neighxlm_tncse_loss(
-                anchor_features=features_anchor,
-                neighbor_features=features_neighbor,
-                raw_anchor=raw_anchor,
-                raw_neighbor=raw_neighbor,
-                neighbor_weights=neighbor_weights
-            )
-
+            if self.config.USE_NEW_LOSS:
+                # 启用新损失函数 (带防爆机制和 TNCSE 约束)
+                loss_cl, loss_infonce, loss_tn = self._compute_neighxlm_tncse_loss(
+                    anchor_features=features_anchor,
+                    neighbor_features=features_neighbor,
+                    raw_anchor=raw_anchor,
+                    raw_neighbor=raw_neighbor
+                )
+            else:
+                # 降级为原始的标准 SimCSE 损失函数
+                loss_cl, loss_infonce, loss_tn = self._compute_original_infonce_loss(
+                    anchor_features=features_anchor,
+                    neighbor_features=features_neighbor
+                )
             # ── (6) 总损失（与 version1 相同的加权公式）─────────────────────
             # L_total = (1 - α) * L_cls_total + α * L_cl_total
             loss = (1.0 - self.alpha) * loss_cls + self.alpha * loss_cl
@@ -344,32 +398,25 @@ class Trainer:
         )
 
     def evaluate(self, data_loader, dataset_name="验证集"):
-        """
-        评估模型性能（与 version1 兼容，仅使用 Anchor 进行推理）
-
-        Args:
-            data_loader  : DataLoader 实例
-            dataset_name : 日志标签
-
-        Returns:
-            accuracy (float): 准确率
-            f1       (float): F1 分数（二分类 binary，三分类 weighted）
-        """
+        """评估模型性能"""
         self.model.eval()   # 关闭 Dropout，进入推理模式
         all_preds = []
         all_labels = []
 
         with torch.no_grad():  # 不记录计算图，节省显存
             for batch in tqdm(data_loader, desc=f"评估{dataset_name}", leave=False):
-                # 评估时仅使用 Anchor（input_ids / attention_mask），忽略 Neighbor 字段
                 input_ids = batch['input_ids'].to(self.config.DEVICE)
                 attention_mask = batch['attention_mask'].to(self.config.DEVICE)
                 labels = batch['label'].to(self.config.DEVICE)
 
-                # 用三个变量接住模型的三个返回值 (我们只需要 logits 用于评估，后面两个对比特征用 _ 占位丢弃)
                 logits, _, _ = self.model(input_ids, attention_mask)
                 preds = torch.argmax(logits, dim=1)
 
+                # 👇 就是补上这两行核心代码 👇
+                all_preds.extend(preds.cpu().tolist())
+                all_labels.extend(labels.cpu().tolist())
+
+        # 现在的列表里终于有数据了，可以正常计算了！
         accuracy = accuracy_score(all_labels, all_preds)
 
         # 根据类别数动态选择 F1 计算方式
